@@ -1152,14 +1152,16 @@ function handleWsMessage({ type, payload }) {
   switch(type) {
 
     case 'record_added':
-      // Add to local cache and refresh UI
-      data.records.push({
-        cardId:      payload.cardId,
-        classroomId: payload.classroomId,
-        teacherCardId: payload.teacherCardId,
-        teacherName: payload.teacherName,
-        timestamp:   payload.timestamp
-      });
+      // Add to local cache only if not already present (avoid duplicate with optimistic update)
+      if (!data.records.some(r => r.cardId === payload.cardId && r.timestamp === payload.timestamp)) {
+        data.records.push({
+          cardId:      payload.cardId,
+          classroomId: payload.classroomId,
+          teacherCardId: payload.teacherCardId,
+          teacherName: payload.teacherName,
+          timestamp:   payload.timestamp
+        });
+      }
       renderRecentScans();
       renderLeaderboard();
       break;
@@ -1443,15 +1445,6 @@ async function doScan() {
     const name        = getDisplayName(cardId);
     const isSlotUnlock = (totalPts % COST_PER_PLAY === 0);
 
-    // Update local cache
-    data.records.push({
-      cardId,
-      classroomId: selectedClassroom,
-      teacherCardId: teacher.cardId,
-      teacherName: teacher.name,
-      timestamp: ts
-    });
-
     showCheckinCard(cardId, name, totalPts, isSlotUnlock);
     renderRecentScans();
     if (el('page-leaderboard').classList.contains('active')) renderLeaderboard();
@@ -1643,9 +1636,10 @@ async function addClassroom() {
   if (!name) { showToast('請輸入教室名稱！', 'warning'); return; }
   if (data.classrooms.find(c => c.name === name)) { showToast('此教室已存在！', 'warning'); return; }
   const id = Date.now().toString();
+  // Optimistic update BEFORE await so the WS broadcast dedup check finds it
+  data.classrooms.push({ id, name });
   try {
     await api('POST', '/api/classrooms', { id, name });
-    data.classrooms.push({ id, name });
     if (el('new-classroom-name')) el('new-classroom-name').value = '';
     renderClassroomList();
     renderFilterOptions();
@@ -1653,7 +1647,9 @@ async function addClassroom() {
     renderTeacherClassroomSelect();
     renderTeacherList();
     showToast('🏫 教室「' + name + '」已新增！', 'success');
-  } catch(e) {}
+  } catch(e) {
+    data.classrooms = data.classrooms.filter(c => c.id !== id); // revert on error
+  }
 }
 
 async function deleteClassroom(id) {
