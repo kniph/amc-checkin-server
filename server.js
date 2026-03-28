@@ -63,6 +63,10 @@ db.exec(`
 try {
   db.exec('ALTER TABLE records ADD COLUMN teacher_card_id TEXT');
 } catch (e) {}
+// Add win_ts (Unix ms) to slot_wins for cooldown calculation.
+try {
+  db.exec('ALTER TABLE slot_wins ADD COLUMN win_ts INTEGER');
+} catch (e) {}
 
 // ── WebSocket broadcast ────────────────────────────
 function broadcast(type, payload) {
@@ -232,8 +236,10 @@ app.delete('/api/records', (req, res) => {
 });
 
 // ── API: Slot machine ──────────────────────────────
-const MAX_DAILY_WINS = 20;
-const COST_PER_PLAY  = 5;
+const MAX_DAILY_WINS      = 50;               // hard safety cap (use cooldown as main rate control)
+const COST_PER_PLAY       = 5;
+const WIN_PROBABILITY     = 0.20;             // 20% per pull when cooldown has cleared
+const MIN_WIN_INTERVAL_MS = 20 * 60 * 1000;  // 20-min global cooldown → ~3 wins/hr max
 
 app.get('/api/slot/status/:cardId', (req, res) => {
   const { cardId } = req.params;
@@ -242,11 +248,10 @@ app.get('/api/slot/status/:cardId', (req, res) => {
   // Total points
   const { total } = db.prepare('SELECT COUNT(*) as total FROM records WHERE card_id = ?').get(cardId);
 
-  // Plays used today
-  const row = db.prepare('SELECT count FROM slot_plays WHERE card_id = ? AND play_date = ?').get(cardId, date);
-  const usedPlays = row ? row.count : 0;
+  // Cumulative plays used (all time, not just today)
+  const usedRow = db.prepare('SELECT SUM(count) as total FROM slot_plays WHERE card_id = ?').get(cardId);
+  const usedPlays = usedRow?.total || 0;
 
-  // Earned plays (total points / cost)
   const earnedPlays = Math.floor(total / COST_PER_PLAY);
   const availablePlays = Math.max(0, earnedPlays - usedPlays);
 
@@ -254,7 +259,15 @@ app.get('/api/slot/status/:cardId', (req, res) => {
   const { wins } = db.prepare('SELECT COUNT(*) as wins FROM slot_wins WHERE win_date = ?').get(date);
   const remainingPrizes = Math.max(0, MAX_DAILY_WINS - wins);
 
-  res.json({ totalPts: total, availablePlays, usedPlays, remainingPrizes, todayWins: wins });
+  // Has this person already won today?
+  const { wonToday } = db.prepare('SELECT COUNT(*) as wonToday FROM slot_wins WHERE card_id = ? AND win_date = ?').get(cardId, date);
+
+  // Global win cooldown
+  const lastWin = db.prepare('SELECT win_ts FROM slot_wins WHERE win_ts IS NOT NULL ORDER BY win_ts DESC LIMIT 1').get();
+  const msSinceLastWin = lastWin ? Date.now() - lastWin.win_ts : Infinity;
+  const cooldownMs = Math.max(0, MIN_WIN_INTERVAL_MS - msSinceLastWin);
+
+  res.json({ totalPts: total, availablePlays, usedPlays, earnedPlays, remainingPrizes, todayWins: wins, hasWonToday: wonToday > 0, cooldownMs });
 });
 
 app.post('/api/slot/play', (req, res) => {
@@ -263,31 +276,43 @@ app.post('/api/slot/play', (req, res) => {
 
   const date = today();
 
-  // Check plays available
+  // Check cumulative plays available (all time)
   const { total } = db.prepare('SELECT COUNT(*) as total FROM records WHERE card_id = ?').get(cardId);
-  const row = db.prepare('SELECT count FROM slot_plays WHERE card_id = ? AND play_date = ?').get(cardId, date);
-  const usedPlays = row ? row.count : 0;
+  const usedRow = db.prepare('SELECT SUM(count) as total FROM slot_plays WHERE card_id = ?').get(cardId);
+  const usedPlays = usedRow?.total || 0;
   const earnedPlays = Math.floor(total / COST_PER_PLAY);
   const availablePlays = earnedPlays - usedPlays;
 
   if (availablePlays <= 0) return res.status(400).json({ error: 'no_plays', message: '沒有可用次數' });
 
-  // Check daily prize cap
+  // Check daily prize cap (safety)
   const { wins } = db.prepare('SELECT COUNT(*) as wins FROM slot_wins WHERE win_date = ?').get(date);
   if (wins >= MAX_DAILY_WINS) return res.status(400).json({ error: 'no_prizes', message: '今日獎品已送完' });
 
-  // Deduct one play
+  // Deduct one play (cumulative — stored per day for analytics, summed for availability)
   db.prepare(`
     INSERT INTO slot_plays (card_id, play_date, count) VALUES (?, ?, 1)
     ON CONFLICT(card_id, play_date) DO UPDATE SET count = count + 1
   `).run(cardId, date);
 
-  // Decide win (30%)
-  const isWin = Math.random() < 0.30;
+  // Per-person daily win limit: max 1 win per person per day
+  const { wonToday } = db.prepare('SELECT COUNT(*) as wonToday FROM slot_wins WHERE card_id = ? AND win_date = ?').get(cardId, date);
+
+  // Global cooldown: min 20 min between wins → ~3 wins/hr
+  const lastWin = db.prepare('SELECT win_ts FROM slot_wins WHERE win_ts IS NOT NULL ORDER BY win_ts DESC LIMIT 1').get();
+  const msSinceLastWin = lastWin ? Date.now() - lastWin.win_ts : Infinity;
+  const cooldownActive = msSinceLastWin < MIN_WIN_INTERVAL_MS;
+
+  // Decide win
+  let isWin = false;
+  if (!wonToday && !cooldownActive) {
+    isWin = Math.random() < WIN_PROBABILITY;
+  }
 
   if (isWin) {
-    const time = new Date().toLocaleTimeString('zh-TW', { hour:'2-digit', minute:'2-digit' });
-    db.prepare('INSERT INTO slot_wins (card_id, win_date, win_time) VALUES (?, ?, ?)').run(cardId, date, time);
+    const ts   = Date.now();
+    const time = new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit' });
+    db.prepare('INSERT INTO slot_wins (card_id, win_date, win_time, win_ts) VALUES (?, ?, ?, ?)').run(cardId, date, time, ts);
     const { wins: newWins } = db.prepare('SELECT COUNT(*) as wins FROM slot_wins WHERE win_date = ?').get(date);
     broadcast('slot_win', { cardId, date, time, todayWins: newWins, remainingPrizes: MAX_DAILY_WINS - newWins });
   }

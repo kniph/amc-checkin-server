@@ -936,10 +936,11 @@ nav {
 // ── Slot machine constants (must be at top) ──
 const SLOT_SYMBOLS   = ['🍦','🍭','🎈','⭐','🎊','🍬','🌈','🎁'];
 const ICE_CREAM      = '🍦';
-const MAX_DAILY_WINS = 20;
+const MAX_DAILY_WINS = 50;
 const COST_PER_PLAY  = 5;
 let slotCardId  = null;
 let slotPlaying = false;
+let slotStatus  = null;  // server-authoritative slot status for current card
 
 // ── API Config ──
 const API_BASE = 'https://amc-checkin-server-production.up.railway.app';
@@ -1209,13 +1210,12 @@ function handleWsMessage({ type, payload }) {
       break;
 
     case 'slot_win':
-      // Update daily prize count across all devices
       renderSlotHistory();
-      if (slotCardId) updateSlotUI();
+      if (slotCardId) refreshSlotStatus().then(() => updateSlotUI());
       break;
 
     case 'slot_play':
-      if (slotCardId) updateSlotUI();
+      if (slotCardId) refreshSlotStatus().then(() => updateSlotUI());
       break;
   }
 }
@@ -1966,16 +1966,17 @@ function initDragDrop() {
 function updateSlotUI() {
   if (!slotCardId) return;
 
-  // Calculate from local cache
-  const pts   = data.records.filter(r => r.cardId === slotCardId).length;
-  const plays = getCardAvailablePlays_local(slotCardId);
+  const pts         = slotStatus ? slotStatus.totalPts      : data.records.filter(r => r.cardId === slotCardId).length;
+  const plays       = slotStatus ? slotStatus.availablePlays : 0;
+  const hasWonToday = slotStatus ? slotStatus.hasWonToday    : false;
 
   if (el('slot-pts-num'))   el('slot-pts-num').textContent   = pts;
   if (el('slot-plays-num')) el('slot-plays-num').textContent = plays;
 
   if (el('slot-card-sub')) {
-    el('slot-card-sub').textContent =
-      '積點 ' + pts + ' 點 ⟶ 可拉 ' + plays + ' 次（每 ' + COST_PER_PLAY + ' 點換 1 次）';
+    el('slot-card-sub').textContent = hasWonToday
+      ? '🍦 今日已領獎！明天還可以繼續抽'
+      : '積點 ' + pts + ' 點 ⟶ 可拉 ' + plays + ' 次（每 ' + COST_PER_PLAY + ' 點換 1 次）';
   }
 
   // Fetch live prize count from server
@@ -1985,7 +1986,7 @@ function updateSlotUI() {
       const remaining = d.remainingPrizes;
       const pct = Math.max(0, (remaining / MAX_DAILY_WINS) * 100);
       if (el('slot-daily-fill'))  el('slot-daily-fill').style.width = pct + '%';
-      if (el('slot-daily-count')) el('slot-daily-count').textContent = remaining + ' / 20';
+      if (el('slot-daily-count')) el('slot-daily-count').textContent = remaining + ' / ' + MAX_DAILY_WINS;
 
       const btn = el('slot-pull-btn');
       if (btn) {
@@ -1994,7 +1995,7 @@ function updateSlotUI() {
           btn.textContent = '🍦 今日獎品已全數送出！';
         } else if (plays <= 0) {
           btn.disabled = true;
-          btn.textContent = pts < COST_PER_PLAY ? '積點不足 ' + COST_PER_PLAY + ' 點' : '今日次數已用完';
+          btn.textContent = pts < COST_PER_PLAY ? '積點不足 ' + COST_PER_PLAY + ' 點' : '次數已用完';
         } else {
           btn.disabled = false;
           btn.textContent = '🎰 拉霸！PULL！（還有 ' + plays + ' 次）';
@@ -2004,38 +2005,22 @@ function updateSlotUI() {
     .catch(() => {});
 }
 
-// Local plays calculation using localStorage as session store
-function getCardUsedPlays_local(cardId) {
+// Fetch server-authoritative slot status for current card
+async function refreshSlotStatus() {
+  if (!slotCardId) return;
   try {
-    const key = 'slot_plays_' + today();
-    const d   = JSON.parse(localStorage.getItem(key)) || {};
-    return d[cardId] || 0;
-  } catch(e) { return 0; }
-}
-
-function setCardUsedPlays_local(cardId, count) {
-  try {
-    const key = 'slot_plays_' + today();
-    const d   = JSON.parse(localStorage.getItem(key)) || {};
-    d[cardId] = count;
-    localStorage.setItem(key, JSON.stringify(d));
+    slotStatus = await api('GET', '/api/slot/status/' + slotCardId);
   } catch(e) {}
 }
 
-function getCardAvailablePlays_local(cardId) {
-  const totalPts   = data.records.filter(r => r.cardId === cardId).length;
-  const earned     = Math.floor(totalPts / COST_PER_PLAY);
-  const used       = getCardUsedPlays_local(cardId);
-  return Math.max(0, earned - used);
-}
-
-function lookupSlotCard() {
+async function lookupSlotCard() {
   const input  = el('slot-card-input');
   if (!input) return;
   const cardId = input.value.trim().toUpperCase();
   if (!cardId) { showToast('請輸入卡號！', 'warning'); return; }
 
   slotCardId = cardId;
+  slotStatus = null;
 
   const overlay = el('slot-nocard-overlay');
   if (overlay) overlay.classList.add('hidden');
@@ -2044,6 +2029,7 @@ function lookupSlotCard() {
   if (el('slot-card-name'))   el('slot-card-name').textContent   = getDisplayName(cardId);
   if (el('slot-card-info'))   el('slot-card-info').style.display = 'flex';
 
+  await refreshSlotStatus();
   updateSlotUI();
   renderSlotHistory();
   input.blur();
@@ -2053,7 +2039,7 @@ async function pullSlot() {
   if (slotPlaying)  return;
   if (!slotCardId)  { showToast('請先輸入卡號查詢！', 'warning'); return; }
 
-  const plays = getCardAvailablePlays_local(slotCardId);
+  const plays = slotStatus ? slotStatus.availablePlays : 0;
   if (plays <= 0)   { showToast('次數不足，繼續刷卡累積積點！', 'warning'); return; }
 
   slotPlaying = true;
@@ -2063,9 +2049,8 @@ async function pullSlot() {
   const resultEl = el('slot-result-msg');
   if (resultEl) resultEl.style.display = 'none';
 
-  // Deduct play locally immediately (for UI responsiveness)
-  const used = getCardUsedPlays_local(slotCardId);
-  setCardUsedPlays_local(slotCardId, used + 1);
+  // Optimistic decrement for immediate UI feedback
+  if (slotStatus) slotStatus.availablePlays = Math.max(0, slotStatus.availablePlays - 1);
 
   // Lever animation
   const pole = el('rm-lever-pole');
@@ -2079,6 +2064,9 @@ async function pullSlot() {
     // Ask server to resolve the play (server decides win/lose with authoritative prize count)
     const result = await api('POST', '/api/slot/play', { cardId: slotCardId });
     const isWin  = result.isWin;
+
+    // Sync authoritative counts from server
+    await refreshSlotStatus();
 
     // Build final symbols
     let finalSymbols;
@@ -2112,11 +2100,10 @@ async function pullSlot() {
     });
 
   } catch(e) {
-    // Server rejected (no plays / no prizes)
+    // Server rejected (no plays / no prizes) — re-sync to restore accurate counts
     if (lights) lights.classList.remove('flashing');
     slotPlaying = false;
-    // Refund the local play deduction
-    setCardUsedPlays_local(slotCardId, used);
+    await refreshSlotStatus();
     updateSlotUI();
   }
 }
