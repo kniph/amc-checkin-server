@@ -1,15 +1,15 @@
 const express = require('express');
-const cors    = require('cors');
-const Database= require('better-sqlite3');
-const http    = require('http');
+const cors = require('cors');
+const Database = require('better-sqlite3');
+const http = require('http');
 const { WebSocketServer } = require('ws');
-const path    = require('path');
+const path = require('path');
 
 // ── Setup ──────────────────────────────────────────
-const app    = express();
+const app = express();
 const server = http.createServer(app);
-const wss    = new WebSocketServer({ server });
-const PORT   = process.env.PORT || 3000;
+const wss = new WebSocketServer({ server });
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
@@ -56,17 +56,23 @@ db.exec(`
     win_date  TEXT NOT NULL,
     win_time  TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS slot_entries (
+    card_id    TEXT NOT NULL,
+    entry_date TEXT NOT NULL,
+    PRIMARY KEY (card_id, entry_date)
+  );
+
+  CREATE TABLE IF NOT EXISTS slot_draws (
+    draw_date TEXT PRIMARY KEY,
+    drawn_at  TEXT NOT NULL
+  );
 `);
 
 // ── DB migration (for existing data.db) ─────────────
-// Add teacher_card_id column if the table was created before this feature.
 try {
   db.exec('ALTER TABLE records ADD COLUMN teacher_card_id TEXT');
-} catch (e) {}
-// Add win_ts (Unix ms) to slot_wins for cooldown calculation.
-try {
-  db.exec('ALTER TABLE slot_wins ADD COLUMN win_ts INTEGER');
-} catch (e) {}
+} catch (e) { }
 
 // ── WebSocket broadcast ────────────────────────────
 function broadcast(type, payload) {
@@ -83,7 +89,21 @@ wss.on('connection', ws => {
 
 // ── Helper ─────────────────────────────────────────
 function today() {
-  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });
+  // Taiwan date (UTC+8)
+  const tw = new Date(Date.now() + 8 * 60 * 60 * 1000);
+  return tw.toISOString().slice(0, 10);
+}
+
+function twHour() {
+  // Taiwan local hour (UTC+8), 0-23
+  const tw = new Date(Date.now() + 8 * 60 * 60 * 1000);
+  return tw.getUTCHours();
+}
+
+function currentUtcHourPrefix() {
+  // win_time is stored as UTC ISO string, so match on UTC hour prefix
+  // e.g. "2026-04-08T06" when Taiwan time is 14:xx (UTC+8)
+  return new Date().toISOString().slice(0, 13); // "YYYY-MM-DDTHH" in UTC
 }
 
 // ── API: Classrooms ────────────────────────────────
@@ -116,7 +136,6 @@ app.delete('/api/classrooms/:id', (req, res) => {
 // ── API: Students ──────────────────────────────────
 app.get('/api/students', (req, res) => {
   const rows = db.prepare('SELECT card_id, name FROM students').all();
-  // Return as { cardId: name } map
   const map = {};
   rows.forEach(r => { map[r.card_id] = r.name; });
   res.json(map);
@@ -131,7 +150,7 @@ app.post('/api/students', (req, res) => {
 });
 
 app.post('/api/students/batch', (req, res) => {
-  const { students } = req.body; // [{ cardId, name }]
+  const { students } = req.body;
   if (!Array.isArray(students)) return res.status(400).json({ error: 'students array required' });
   const insert = db.prepare('INSERT OR REPLACE INTO students (card_id, name) VALUES (?, ?)');
   const tx = db.transaction(() => {
@@ -159,7 +178,6 @@ app.post('/api/teachers', (req, res) => {
   if (!cardId || !name || !classroomId) {
     return res.status(400).json({ error: 'cardId, name, classroomId required' });
   }
-
   try {
     db.prepare('INSERT OR REPLACE INTO teachers (card_id, name, classroom_id) VALUES (?, ?, ?)').run(cardId, name, classroomId);
     res.json({ ok: true });
@@ -204,7 +222,6 @@ app.post('/api/records', (req, res) => {
     return res.status(400).json({ error: 'cardId, classroomId, timestamp, teacherCardId required' });
   }
 
-  // Validate teacher exists and is responsible for the classroom.
   const teacher = db.prepare('SELECT card_id as cardId, name, classroom_id as classroomId FROM teachers WHERE card_id = ?').get(teacherCardId);
   if (!teacher) return res.status(403).json({ error: 'teacher not bound' });
   if (teacher.classroomId !== classroomId) return res.status(403).json({ error: 'teacher classroom mismatch' });
@@ -213,7 +230,6 @@ app.post('/api/records', (req, res) => {
     'INSERT INTO records (card_id, classroom_id, teacher_card_id, timestamp) VALUES (?, ?, ?, ?)'
   ).run(cardId, classroomId, teacherCardId, timestamp);
 
-  // Get total points for this card
   const { total } = db.prepare(
     'SELECT COUNT(*) as total FROM records WHERE card_id = ?'
   ).get(cardId);
@@ -235,92 +251,127 @@ app.delete('/api/records', (req, res) => {
   res.json({ ok: true });
 });
 
-// ── API: Slot machine ──────────────────────────────
-const MAX_DAILY_WINS      = 20;               // 13:00–21:00，8 hr × 2-3 次 ≈ 20 份大獎/日
-const COST_PER_PLAY       = 5;
-const WIN_PROBABILITY     = 0.20;             // 20% per pull when cooldown has cleared
-const MIN_WIN_INTERVAL_MS = 20 * 60 * 1000;  // 20-min global cooldown → ~3 wins/hr max
+// ── API: Lottery ───────────────────────────────────
+const MAX_DAILY_WINS = 21; // [FIX #1] 全天總上限改為 21
+const MAX_HOURLY_WINS = 3;  // [FIX #1] 每小時上限 3 人
+const MAX_WINS_PER_PERSON = 2;  // 每人累計最多中獎次數
+const COST_PER_PLAY = 5;  // 每 5 點換 1 次
 
+// 中獎機率（依累計中獎次數）
+function getWinProb(histWins) {
+  if (histWins === 0) return 0.12;
+  if (histWins === 1) return 0.05;
+  return 0;
+}
+
+// GET /api/slot/status/:cardId
 app.get('/api/slot/status/:cardId', (req, res) => {
   const { cardId } = req.params;
   const date = today();
+  const hourPfx = currentUtcHourPrefix();
 
-  // Total points
+  // [FIX #3] 終身總積點 vs 終身總用次數
   const { total } = db.prepare('SELECT COUNT(*) as total FROM records WHERE card_id = ?').get(cardId);
-
-  // Cumulative plays used (all time, not just today)
-  const usedRow = db.prepare('SELECT SUM(count) as total FROM slot_plays WHERE card_id = ?').get(cardId);
-  const usedPlays = usedRow?.total || 0;
-
+  const { usedPlays } = db.prepare(
+    'SELECT COALESCE(SUM(count), 0) as usedPlays FROM slot_plays WHERE card_id = ?'
+  ).get(cardId);
   const earnedPlays = Math.floor(total / COST_PER_PLAY);
   const availablePlays = Math.max(0, earnedPlays - usedPlays);
 
-  // Today's total wins (global)
-  const { wins } = db.prepare('SELECT COUNT(*) as wins FROM slot_wins WHERE win_date = ?').get(date);
-  const remainingPrizes = Math.max(0, MAX_DAILY_WINS - wins);
+  const { todayCnt } = db.prepare('SELECT COUNT(*) as todayCnt FROM slot_wins WHERE card_id = ? AND win_date = ?').get(cardId, date);
+  const { histWins } = db.prepare('SELECT COUNT(*) as histWins FROM slot_wins WHERE card_id = ?').get(cardId);
+  const { totalWins } = db.prepare('SELECT COUNT(*) as totalWins FROM slot_wins WHERE win_date = ?').get(date);
+  const { hourlyWins } = db.prepare(
+    "SELECT COUNT(*) as hourlyWins FROM slot_wins WHERE win_date = ? AND win_time LIKE ?"
+  ).get(date, hourPfx + '%');  // [FIX #1] 本小時中獎數
 
-  // Has this person already won today?
-  const { wonToday } = db.prepare('SELECT COUNT(*) as wonToday FROM slot_wins WHERE card_id = ? AND win_date = ?').get(cardId, date);
+  const canWin = histWins < MAX_WINS_PER_PERSON;
 
-  // Global win cooldown
-  const lastWin = db.prepare('SELECT win_ts FROM slot_wins WHERE win_ts IS NOT NULL ORDER BY win_ts DESC LIMIT 1').get();
-  const msSinceLastWin = lastWin ? Date.now() - lastWin.win_ts : Infinity;
-  const cooldownMs = Math.max(0, MIN_WIN_INTERVAL_MS - msSinceLastWin);
-
-  res.json({ totalPts: total, availablePlays, usedPlays, earnedPlays, remainingPrizes, todayWins: wins, hasWonToday: wonToday > 0, cooldownMs });
+  res.json({
+    totalPts: total,
+    availablePlays,
+    usedPlays,
+    earnedPlays,
+    hasWonToday: todayCnt > 0,
+    winCount: histWins,
+    winProb: getWinProb(histWins),
+    canWin,
+    remainingPrizes: Math.max(0, MAX_DAILY_WINS - totalWins),
+    remainingHourly: Math.max(0, MAX_HOURLY_WINS - hourlyWins), // [FIX #1]
+    totalWins
+  });
 });
 
+// POST /api/slot/play
 app.post('/api/slot/play', (req, res) => {
   const { cardId } = req.body;
   if (!cardId) return res.status(400).json({ error: 'cardId required' });
 
+  const twH = twHour();
+  if (twH < 13 || twH >= 20) {
+    return res.status(400).json({ error: 'closed', message: '活動時間為台灣時間 13:00–20:00' });
+  }
+
   const date = today();
+  const hourPfx = currentUtcHourPrefix();
 
-  // Check cumulative plays available (all time)
+  // [FIX #3] 終身總用次數（跨日累計）
   const { total } = db.prepare('SELECT COUNT(*) as total FROM records WHERE card_id = ?').get(cardId);
-  const usedRow = db.prepare('SELECT SUM(count) as total FROM slot_plays WHERE card_id = ?').get(cardId);
-  const usedPlays = usedRow?.total || 0;
+  const { usedPlays } = db.prepare(
+    'SELECT COALESCE(SUM(count), 0) as usedPlays FROM slot_plays WHERE card_id = ?'
+  ).get(cardId);
   const earnedPlays = Math.floor(total / COST_PER_PLAY);
-  const availablePlays = earnedPlays - usedPlays;
+  if (earnedPlays - usedPlays <= 0) {
+    return res.status(400).json({ error: 'no_plays', message: '沒有可用次數，繼續刷卡累積積點！' });
+  }
 
-  if (availablePlays <= 0) return res.status(400).json({ error: 'no_plays', message: '沒有可用次數' });
+  // 已中獎2次者 getWinProb 回傳 0，isWin 永遠 false，仍可正常拉霸並消耗次數
+  const { histWins } = db.prepare('SELECT COUNT(*) as histWins FROM slot_wins WHERE card_id = ?').get(cardId);
 
-  // Check daily prize cap (safety)
-  const { wins } = db.prepare('SELECT COUNT(*) as wins FROM slot_wins WHERE win_date = ?').get(date);
-  if (wins >= MAX_DAILY_WINS) return res.status(400).json({ error: 'no_prizes', message: '今日獎品已送完' });
+  // [FIX #1] 全天上限
+  const { dailyWins } = db.prepare('SELECT COUNT(*) as dailyWins FROM slot_wins WHERE win_date = ?').get(date);
+  if (dailyWins >= MAX_DAILY_WINS) {
+    return res.status(400).json({ error: 'no_prizes', message: '今日獎品已全數送出！' });
+  }
 
-  // Deduct one play (cumulative — stored per day for analytics, summed for availability)
+  // [FIX #1] 每小時上限
+  const { hourlyWins } = db.prepare(
+    "SELECT COUNT(*) as hourlyWins FROM slot_wins WHERE win_date = ? AND win_time LIKE ?"
+  ).get(date, hourPfx + '%');
+  if (hourlyWins >= MAX_HOURLY_WINS) {
+    return res.status(400).json({ error: 'hourly_limit', message: '本小時中獎名額已滿，下個小時再試！' });
+  }
+
+  // 先扣次數（防止重試作弊）
   db.prepare(`
     INSERT INTO slot_plays (card_id, play_date, count) VALUES (?, ?, 1)
     ON CONFLICT(card_id, play_date) DO UPDATE SET count = count + 1
   `).run(cardId, date);
 
-  // Per-person daily win limit: max 1 win per person per day
-  const { wonToday } = db.prepare('SELECT COUNT(*) as wonToday FROM slot_wins WHERE card_id = ? AND win_date = ?').get(cardId, date);
+  const winProb = getWinProb(histWins);
+  const isWin = Math.random() < winProb;
 
-  // Global cooldown: min 20 min between wins → ~3 wins/hr
-  const lastWin = db.prepare('SELECT win_ts FROM slot_wins WHERE win_ts IS NOT NULL ORDER BY win_ts DESC LIMIT 1').get();
-  const msSinceLastWin = lastWin ? Date.now() - lastWin.win_ts : Infinity;
-  const cooldownActive = msSinceLastWin < MIN_WIN_INTERVAL_MS;
-
-  // Decide win
-  let isWin = false;
-  if (!wonToday && !cooldownActive) {
-    isWin = Math.random() < WIN_PROBABILITY;
-  }
+  const newUsed = usedPlays + 1;
+  const newAvailable = Math.max(0, earnedPlays - newUsed);
 
   if (isWin) {
-    const ts   = Date.now();
-    const time = new Date().toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit' });
-    db.prepare('INSERT INTO slot_wins (card_id, win_date, win_time, win_ts) VALUES (?, ?, ?, ?)').run(cardId, date, time, ts);
-    const { wins: newWins } = db.prepare('SELECT COUNT(*) as wins FROM slot_wins WHERE win_date = ?').get(date);
-    broadcast('slot_win', { cardId, date, time, todayWins: newWins, remainingPrizes: MAX_DAILY_WINS - newWins });
+    const winTime = new Date().toISOString();
+    db.prepare('INSERT INTO slot_wins (card_id, win_date, win_time) VALUES (?, ?, ?)').run(cardId, date, winTime);
+    const { newTotal } = db.prepare('SELECT COUNT(*) as newTotal FROM slot_wins WHERE win_date = ?').get(date);
+    broadcast('slot_win', {
+      cardId,
+      date,
+      time: winTime,
+      totalWins: newTotal,
+      remainingPrizes: MAX_DAILY_WINS - newTotal
+    });
   }
 
   broadcast('slot_play', { cardId, isWin });
-  res.json({ ok: true, isWin });
+  res.json({ ok: true, isWin, availablePlays: newAvailable });
 });
 
+// GET /api/slot/winners — 今日中獎名單
 app.get('/api/slot/winners', (req, res) => {
   const date = today();
   const rows = db.prepare(
@@ -329,11 +380,25 @@ app.get('/api/slot/winners', (req, res) => {
   res.json(rows);
 });
 
+// GET /api/slot/daily — 今日統計
 app.get('/api/slot/daily', (req, res) => {
   const date = today();
-  const { wins } = db.prepare('SELECT COUNT(*) as wins FROM slot_wins WHERE win_date = ?').get(date);
-  res.json({ todayWins: wins, remainingPrizes: Math.max(0, MAX_DAILY_WINS - wins) });
+  const hourPfx = currentUtcHourPrefix();
+  const { totalWins } = db.prepare('SELECT COUNT(*) as totalWins FROM slot_wins WHERE win_date = ?').get(date);
+  const { totalEntries } = db.prepare('SELECT COUNT(*) as totalEntries FROM slot_entries WHERE entry_date = ?').get(date);
+  const { hourlyWins } = db.prepare(
+    "SELECT COUNT(*) as hourlyWins FROM slot_wins WHERE win_date = ? AND win_time LIKE ?"
+  ).get(date, hourPfx + '%');
+  res.json({
+    totalWins,
+    totalEntries,
+    remainingPrizes: Math.max(0, MAX_DAILY_WINS - totalWins),
+    remainingHourly: Math.max(0, MAX_HOURLY_WINS - hourlyWins),
+    maxDailyWins: MAX_DAILY_WINS,
+    maxHourlyWins: MAX_HOURLY_WINS
+  });
 });
+
 
 // ── Health check ───────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
