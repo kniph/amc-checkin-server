@@ -2058,52 +2058,64 @@ async function pullSlot() {
   const lights = el('rm-lights');
   if (lights) lights.classList.add('flashing');
 
+  // 直接用 fetch，不走 api()，避免遊戲規則攔截被誤判為「網路錯誤」
+  let isWin = false;
   try {
-    const result = await api('POST', '/api/slot/play', { cardId: slotCardId });
-    const isWin  = result.isWin;
-
-    // 同步伺服器正確數值
-    await refreshSlotStatus();
-
-    let finalSymbols;
-    if (isWin) {
-      finalSymbols = [ICE_CREAM, ICE_CREAM, ICE_CREAM];
-    } else {
-      const pool = SLOT_SYMBOLS.filter(s => s !== ICE_CREAM);
-      finalSymbols = [
-        pool[Math.floor(Math.random() * pool.length)],
-        pool[Math.floor(Math.random() * pool.length)],
-        pool[Math.floor(Math.random() * pool.length)],
-      ];
-      if (finalSymbols[0] === finalSymbols[1] && finalSymbols[1] === finalSymbols[2]) {
-        finalSymbols[2] = pool.find(s => s !== finalSymbols[0]) || '🎁';
-      }
-    }
-
-    animateReels(finalSymbols, () => {
-      if (lights) lights.classList.remove('flashing');
-      slotPlaying = false;
-      if (isWin) {
-        fireConfetti();
-        showWinOverlay(slotCardId);
-        showSlotResult('🍦 恭喜中獎！獲得一杯冰淇淋！', 'win');
-        renderSlotHistory();
-      } else {
-        const left = slotStatus ? slotStatus.availablePlays : 0;
-        const msgs = left > 0
-          ? ['😢 差一點！還有 ' + left + ' 次，繼續加油！', '🌈 沒中！還有 ' + left + ' 次機會！', '🎈 再來一次！還剩 ' + left + ' 次！']
-          : ['😢 次數用完！刷卡累積積點再來！', '🍭 明天繼續加油！', '⭐ 刷卡多累積點數，下次更多機會！'];
-        showSlotResult(msgs[Math.floor(Math.random() * msgs.length)], 'lose');
-      }
-      updateSlotUI();
+    const resp = await fetch(API_BASE + '/api/slot/play', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cardId: slotCardId })
     });
 
-  } catch(e) {
+    if (resp.ok) {
+      const result = await resp.json();
+      isWin = result.isWin;
+    } else {
+      // 遊戲規則攔截（hourly_limit / no_prizes / closed / max_wins）
+      // 對抽獎者來說就是「沒中獎」，不顯示任何提示
+      isWin = false;
+    }
+  } catch (networkErr) {
+    // 真正的網路斷線
     if (lights) lights.classList.remove('flashing');
     slotPlaying = false;
+    showToast('連線問題，請稍後再試', 'error');
     await refreshSlotStatus();
     updateSlotUI();
+    return;
   }
+
+  // 同步伺服器正確數值
+  await refreshSlotStatus();
+
+  const pool = SLOT_SYMBOLS.filter(s => s !== ICE_CREAM);
+  const loseSym = [
+    pool[Math.floor(Math.random() * pool.length)],
+    pool[Math.floor(Math.random() * pool.length)],
+    pool[Math.floor(Math.random() * pool.length)],
+  ];
+  if (loseSym[0] === loseSym[1] && loseSym[1] === loseSym[2]) {
+    loseSym[2] = pool.find(s => s !== loseSym[0]) || '🎁';
+  }
+  const finalSymbols = isWin ? [ICE_CREAM, ICE_CREAM, ICE_CREAM] : loseSym;
+
+  animateReels(finalSymbols, () => {
+    if (lights) lights.classList.remove('flashing');
+    slotPlaying = false;
+    if (isWin) {
+      fireConfetti();
+      showWinOverlay(slotCardId);
+      showSlotResult('🍦 恭喜中獎！獲得一杯冰淇淋！', 'win');
+      renderSlotHistory();
+    } else {
+      const left = slotStatus ? slotStatus.availablePlays : 0;
+      const msgs = left > 0
+        ? ['😢 差一點！還有 ' + left + ' 次，繼續加油！', '🌈 沒中！還有 ' + left + ' 次機會！', '🎈 再來一次！還剩 ' + left + ' 次！']
+        : ['😢 次數用完！刷卡累積積點再來！', '🍭 明天繼續加油！', '⭐ 刷卡多累積點數，下次更多機會！'];
+      showSlotResult(msgs[Math.floor(Math.random() * msgs.length)], 'lose');
+    }
+    updateSlotUI();
+  });
 }
 
 function animateReels(finalSymbols, onDone) {
