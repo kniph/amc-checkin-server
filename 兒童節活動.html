@@ -936,7 +936,7 @@ nav {
 // ── Slot machine constants (must be at top) ──
 const SLOT_SYMBOLS   = ['🍦','🍭','🎈','⭐','🎊','🍬','🌈','🎁'];
 const ICE_CREAM      = '🍦';
-const MAX_DAILY_WINS = 20;
+const MAX_DAILY_WINS = 21;
 const COST_PER_PLAY  = 5;
 let slotCardId  = null;
 let slotPlaying = false;
@@ -1961,9 +1961,7 @@ function updateSlotUI() {
   if (el('slot-plays-num')) el('slot-plays-num').textContent = availablePlays;
 
   if (el('slot-card-sub')) {
-    if (!canWin) {
-      el('slot-card-sub').textContent = '趕快再繼續集點抽獎吧！';
-    } else if (availablePlays > 0) {
+    if (availablePlays > 0) {
       el('slot-card-sub').textContent = hasWonToday
         ? '🍦 已中獎 ' + winCount + ' 次！還有 ' + availablePlays + ' 次機會繼續抽！'
         : '積點 ' + totalPts + ' 點 → 可抽 ' + availablePlays + ' 次（每 ' + COST_PER_PLAY + ' 點換 1 次）';
@@ -1997,9 +1995,6 @@ function updateSlotUI() {
         } else if (availablePlays <= 0) {
           btn.disabled = true;
           btn.textContent = totalPts < COST_PER_PLAY ? '積點不足，繼續刷卡！' : '今日次數已用完';
-        } else if (!canWin) {
-          btn.disabled = false;
-          btn.textContent = '未中獎，請繼續加油';
         } else {
           btn.disabled = false;
           btn.textContent = '🎰 拉霸！PULL！（還有 ' + availablePlays + ' 次）';
